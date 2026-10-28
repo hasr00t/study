@@ -1,0 +1,321 @@
+{
+  "title": "Ghost SPNs & Kerberos Reflection to SYSTEM over SMB (CVE-2025-58726)",
+  "slug": "ghost-spns",
+  "role": "penetration tester",
+  "goal": "find and report exploitable ghost SPNs on an internal test, with remediation",
+  "createdAt": "2026-10-27",
+  "sections": [
+    {
+      "id": "what-youll-learn",
+      "title": "What You'll Learn",
+      "type": "intro",
+      "content": "By the end of this guide you should be able to walk onto an internal engagement,\nfind Service Principal Names whose hostnames no longer resolve in DNS, decide\nwhether each one is actually **exploitable** or merely **stale**, and write a\nfinding with remediation that a client's AD team can act on. That is the end\nresult everything here is written toward. Not \"understand Kerberos\" in the\nabstract, but produce a defensible ghost-SPN finding.\n\nThe attack chains a handful of ordinary conditions into **SYSTEM on a target\nserver, starting from a plain domain account**: a leftover SPN, default DNS write\nrights, SMB signing left optional, and a way to make a machine authenticate. The\nskill that matters most here is not running the exploit. It is telling\n\"exploitable\" apart from \"hygiene issue\", because most ghost SPNs you find will be\nthe latter, and reporting them as the former costs you credibility."
+    },
+    {
+      "id": "priming",
+      "title": "Priming Pass",
+      "type": "priming",
+      "content": "**How this guide is ordered, and why.** The breakdown is built so each section\nremoves one way of being wrong about the next. We start with the single idea the\nwhole attack rests on, that an SPN's *identity* and its *DNS routing* are two\nseparate decisions, because every later confusion traces back to merging them.\nThen the reflection mechanism, then why the result can become SYSTEM (with the\nnuance that it is not automatic), then the precondition conjunction that decides\nexploitability, then the two-CVE story, then what the patch does and does not\nclose. Definitions come first so every term in the breakdown is already on the\ntable. Read the breakdown twice: once for the top line of each section, once for\nthe nuance underneath.\n\n**Priming questions.** Attempt these *before* reading on. They are mostly\nunanswerable cold. That is the point; they tell your brain what to look for.\n\n1. How can a Kerberos ticket for `cifs/oldhost.corp.local` be accepted by server\n   `FS01` when `oldhost` resolves to *your* IP address?\n2. Why might requiring SMB signing on a host's *outbound* client connections fail\n   to protect it?\n3. Can a standard domain user create a DNS record for a name that does not exist,\n   yet be unable to modify a name that does?\n4. Why does a machine authenticating *as its own account* not automatically mean\n   you get SYSTEM?\n5. The June 2025 patch was called \"the SMB reflection fix.\" Why did a\n   fully-patched-against-that host still fall to this in October 2025?\n6. You find a non-resolving `HOST/` SPN. What four other things must be true\n   before you can call it exploitable rather than stale?"
+    },
+    {
+      "id": "key-concepts",
+      "title": "Key Concepts & Definitions",
+      "type": "definitions",
+      "content": "| Term | Definition |\n|------|-----------|\n| **SPN (Service Principal Name)** | A string identifying a service instance for Kerberos, form `class/host[:port][/name]`, such as `CIFS/fs01.corp.local`. The KDC uses it to find the account that owns the service and to pick the key that encrypts the ticket. It is an AD attribute, not a DNS record. |\n| **Ghost SPN** *(this attack)* | An SPN whose hostname does **not resolve** in the relevant DNS view. Causes include decommissioned hosts, pre-staged services, deployment typos, cross-forest or hybrid names, and broken aliases. The unresolvable name is what an attacker can claim. |\n| **Ghost SPN** *(Trellix, unrelated)* | A different technique sharing the name: briefly adding an SPN to a *user* account to Kerberoast it stealthily, then removing it. Not reflection, not this CVE. |\n| **HOST / CIFS SPN** | Computer accounts auto-register `HOST/` SPNs. `HOST` substitutes for several service classes including `CIFS` (SMB), so a client can request `CIFS/<host>` and get a ticket to the machine account even with no explicit `CIFS/` registration. |\n| **SPN ownership** | The AD account that holds a given `servicePrincipalName` value. Separate from ownership of the matching DNS name, which is the crux of the attack. |\n| **Kerberos reflection** | Capturing a host's authentication and sending it back to that same host's service, so it authenticates to itself. Distinct from *relay*, which forwards to a different service. |\n| **AP-REQ** | The Kerberos application request a client sends to a service: a service ticket (encrypted with the service account's long-term key) plus an authenticator. The reflected object. |\n| **Coercion** | Forcing a machine to authenticate to an attacker-chosen host, often as SYSTEM via LSASS. Primitives include PetitPotam (MS-EFSR), PrinterBug (MS-RPRN), DFSCoerce, and Coercer. |\n| **SMB signing** | Cryptographic signing of SMB messages with session keys. When **required** on the receiving (inbound) side, a reflected session cannot produce valid signed operations and dies. The decisive control. |\n| **Signing enabled vs required** | \"Enabled\" means the host *can* sign; \"required\" means it *refuses* unsigned sessions. Only *required* blocks reflection. A legitimate signed connection does not prove unsigned ones are refused. |\n| **ADIDNS** | AD-integrated DNS: zones stored as `dnsNode` objects in AD. The default zone ACL grants Authenticated Users the right to create new child records. |\n| **Create vs modify (DNS)** | Creating an absent `dnsNode` and modifying an existing one are different access checks. Being unable to overwrite `fs01` says nothing about whether you can create an absent alias. A logically deleted name may linger as a tombstoned node (`dNSTombstoned=TRUE`). |\n| **SYSTEM vs NetworkService** | Both local identities present the *machine account's* credentials on the network. A captured `HOST$` authentication alone does not prove the originating context was SYSTEM. |\n| **CVE-2025-33073** | The predecessor: client-side NTLM/Kerberos reflection over SMB (Synacktiv, patched June 2025). CVSS 8.8, in CISA KEV, actively exploited. Different bug, different patch. |\n| **CVE-2025-58726** | This one: SMB **server**-side elevation of privilege via ghost-SPN Kerberos reflection (Semperis, patched October 2025). CVSS 7.5, exploit maturity Unproven. |",
+      "definitions": [
+        {
+          "term": "**SPN (Service Principal Name)**",
+          "definition": "A string identifying a service instance for Kerberos, form `class/host[:port][/name]`, such as `CIFS/fs01.corp.local`. The KDC uses it to find the account that owns the service and to pick the key that encrypts the ticket. It is an AD attribute, not a DNS record."
+        },
+        {
+          "term": "**Ghost SPN** *(this attack)*",
+          "definition": "An SPN whose hostname does **not resolve** in the relevant DNS view. Causes include decommissioned hosts, pre-staged services, deployment typos, cross-forest or hybrid names, and broken aliases. The unresolvable name is what an attacker can claim."
+        },
+        {
+          "term": "**Ghost SPN** *(Trellix, unrelated)*",
+          "definition": "A different technique sharing the name: briefly adding an SPN to a *user* account to Kerberoast it stealthily, then removing it. Not reflection, not this CVE."
+        },
+        {
+          "term": "**HOST / CIFS SPN**",
+          "definition": "Computer accounts auto-register `HOST/` SPNs. `HOST` substitutes for several service classes including `CIFS` (SMB), so a client can request `CIFS/<host>` and get a ticket to the machine account even with no explicit `CIFS/` registration."
+        },
+        {
+          "term": "**SPN ownership**",
+          "definition": "The AD account that holds a given `servicePrincipalName` value. Separate from ownership of the matching DNS name, which is the crux of the attack."
+        },
+        {
+          "term": "**Kerberos reflection**",
+          "definition": "Capturing a host's authentication and sending it back to that same host's service, so it authenticates to itself. Distinct from *relay*, which forwards to a different service."
+        },
+        {
+          "term": "**AP-REQ**",
+          "definition": "The Kerberos application request a client sends to a service: a service ticket (encrypted with the service account's long-term key) plus an authenticator. The reflected object."
+        },
+        {
+          "term": "**Coercion**",
+          "definition": "Forcing a machine to authenticate to an attacker-chosen host, often as SYSTEM via LSASS. Primitives include PetitPotam (MS-EFSR), PrinterBug (MS-RPRN), DFSCoerce, and Coercer."
+        },
+        {
+          "term": "**SMB signing**",
+          "definition": "Cryptographic signing of SMB messages with session keys. When **required** on the receiving (inbound) side, a reflected session cannot produce valid signed operations and dies. The decisive control."
+        },
+        {
+          "term": "**Signing enabled vs required**",
+          "definition": "\"Enabled\" means the host *can* sign; \"required\" means it *refuses* unsigned sessions. Only *required* blocks reflection. A legitimate signed connection does not prove unsigned ones are refused."
+        },
+        {
+          "term": "**ADIDNS**",
+          "definition": "AD-integrated DNS: zones stored as `dnsNode` objects in AD. The default zone ACL grants Authenticated Users the right to create new child records."
+        },
+        {
+          "term": "**Create vs modify (DNS)**",
+          "definition": "Creating an absent `dnsNode` and modifying an existing one are different access checks. Being unable to overwrite `fs01` says nothing about whether you can create an absent alias. A logically deleted name may linger as a tombstoned node (`dNSTombstoned=TRUE`)."
+        },
+        {
+          "term": "**SYSTEM vs NetworkService**",
+          "definition": "Both local identities present the *machine account's* credentials on the network. A captured `HOST$` authentication alone does not prove the originating context was SYSTEM."
+        },
+        {
+          "term": "**CVE-2025-33073**",
+          "definition": "The predecessor: client-side NTLM/Kerberos reflection over SMB (Synacktiv, patched June 2025). CVSS 8.8, in CISA KEV, actively exploited. Different bug, different patch."
+        },
+        {
+          "term": "**CVE-2025-58726**",
+          "definition": "This one: SMB **server**-side elevation of privilege via ghost-SPN Kerberos reflection (Semperis, patched October 2025). CVSS 7.5, exploit maturity Unproven."
+        }
+      ]
+    },
+    {
+      "id": "rules-frameworks",
+      "title": "Rules & Frameworks",
+      "type": "rules",
+      "content": "Named heuristics to carry into the engagement without re-reading anything.\n\n1. **The Three Decisions.** For every candidate, answer three questions\n   *separately*. **Routing**: where does the target connect (DNS)? **Identity**:\n   which AD account owns the requested SPN? **Authorization**: what token results\n   at the receiving service? Merging them into \"the hostname belongs to the\n   target\" is the root of almost every wrong call.\n2. **\"Resolves in Kerberos, not in DNS.\"** The SPN-to-account lookup and the\n   hostname-to-IP lookup are independent. The gap between them is the attack\n   surface.\n3. **The Five Gates.** Exploitable needs *all* of: a ghost `HOST`/`CIFS` SPN on a\n   reachable target; a DNS name you can claim; target SMB signing that is **not\n   required**; a coercion primitive that reaches the target; and a target missing\n   the October 2025 fix. A verified **No** at any gate breaks the path. An\n   **Unknown** is missing evidence, not a pass.\n4. **\"Enabled is not required.\"** For signing, the only question that matters is\n   whether the *target's inbound* side *requires* it. Outbound or client signing\n   is not equivalent protection.\n5. **\"Unresolved is a lead, not a verdict.\"** A non-resolving SPN is a candidate\n   for owner validation, not proof of anything. Benign causes are common.\n6. **The Evidence Ladder.** Report the highest rung you actually reached:\n   unresolved name observed; ownership confirmed; DNS control established;\n   authentication received; reflection accepted; privileged operation\n   demonstrated. Do not attach the CVE as \"confirmed\" at the DNS-control rung.\n7. **\"A patch names a trick, not a class.\"** The June fix killed one coercion\n   trick; the reflection *class* survived as this CVE. When you read a fix, ask\n   which precondition it removed and whether another path reaches the same sink."
+    },
+    {
+      "id": "spn-ownership-vs-dns-routing",
+      "title": "SPN Ownership vs DNS Routing",
+      "type": "breakdown",
+      "content": "**What it is.** The one idea the attack rests on. An SPN is an authentication\nidentifier stored in AD, and a DNS record is a routing entry. They are maintained\nby different processes and can disagree.\n\n**How it works.** Resolving a service happens in two independent steps. The\n**Kerberos step**: the KDC matches the SPN *string* to an account and issues a\nticket encrypted with that account's key. No DNS is consulted. The **network\nstep**: the client resolves the *hostname inside the SPN* via DNS to know where to\nconnect. Because they are independent, an SPN like `CIFS/oldhost.corp.local` can\nsit happily on `FS01$`'s account while `oldhost` resolves to nothing, or, once you\nregister it, to you.\n\n**Why it matters.** If you make the ghost name resolve to your relay, you change\n*routing* without changing *identity*. The KDC still issues a ticket for the real\nowner (`FS01$`); the victim just sends it to your address. That split is the whole\nattack. It also means pointing a ghost name at yourself does nothing if the SPN\nbelongs to an unrelated account, because the resulting ticket would not be\ndecryptable by the target's SMB service. The owning account is decisive.\n\n**Example.** `FS01$` has `HOST/legacyfiles.corp.local` registered, but\n`legacyfiles` is NXDOMAIN. As a normal user you add `legacyfiles → your-IP` in\nADIDNS. Nothing about `FS01$`'s ownership of the SPN changed; you only decided\nwhere traffic to that name now goes."
+    },
+    {
+      "id": "the-reflection-mechanism",
+      "title": "The Reflection Mechanism",
+      "type": "breakdown",
+      "content": "**What it is.** Turning that routing/identity split into an authentication you can\nbounce off the target's own SMB server.\n\n**How it works.** Step by step, conceptually:\n\n```\nlow-priv user ──(1 register ghost name in ADIDNS)──▶ ghost → attacker relay\n      │\n      (2 coerce target FS01 to \\\\legacyfiles\\...)\n      ▼\n   FS01 ──(3 ask KDC for CIFS/legacyfiles)──▶ KDC ──(ticket for FS01$)──▶ FS01\n      │\n      (4 FS01 sends AP-REQ to the ghost name = attacker relay)\n      ▼\n   relay ──(5 forward that AP-REQ to FS01's own SMB :445)──▶ FS01\n      │\n      (6 FS01 accepts auth for an SPN it owns → session as FS01$)\n      ▼\n   action as the machine identity\n```\n\nThe relayed object is the **AP-REQ**. You never forge a ticket or recover a\npassword. Note what receiving an AP-REQ does *not* give you: the session subkey\nneeded to sign arbitrary follow-on SMB messages. That is exactly why required\nsigning kills the attack.\n\n**Why it matters.** The starting point is a plain domain account and the finish is\na session as the target's machine account. The tooling that performs the relay\n(the research used **KrbRelayEx** by decoder-it) and the coercion (PetitPotam or\nPrinterBug) are named here so you recognise them in logs and reports. On a real\nengagement your job is usually to prove the *conditions* line up, not to fire the\nfull chain unless it is explicitly scoped.\n\n**Example.** Continuing above: you coerce `FS01` with PetitPotam to\n`\\\\legacyfiles\\pipe\\...`. `FS01` (as SYSTEM) asks the KDC for `CIFS/legacyfiles`,\ngets a ticket under its own `FS01$` key, and sends the AP-REQ to your relay. The\nrelay forwards it to `FS01:445`. `FS01` accepts, because it owns that SPN, and the\nsession authenticates as `FS01$`."
+    },
+    {
+      "id": "why-the-result-can-become-system",
+      "title": "Why the Result Can Become SYSTEM",
+      "type": "breakdown",
+      "content": "**What it is.** The step most people oversimplify. \"The machine authenticates to\nitself, so you're SYSTEM\" is *almost* right, and wrong in a way that matters for\nreporting.\n\n**How it works.** SYSTEM and NetworkService *both* use the machine account's\ncredentials on the network, so the account name `FS01$` alone tells you nothing\nabout the local privilege the authentication originated from. Per Synacktiv's\nreverse engineering: when a SYSTEM or NetworkService context creates Kerberos\nauthentication, Windows records a link between the authenticator subkey and the\noriginating logon context. When the host accepts authentication as its own\naccount, it can look that subkey up; if the matching context originated as\n**SYSTEM**, token construction yields a SYSTEM identity with local admin\nmembership. So the SYSTEM outcome depends on the *originating context*, not on the\naccount name.\n\n**Why it matters.** In a report, \"I received `FS01$` authentication\" is the\nauthentication-received rung of the Evidence Ladder, not SYSTEM compromise. A\nreflected NetworkService context, or ordinary machine-account auth obtained\nanother way, does not establish SYSTEM. Say what you proved.\n\n**Example.** You capture authentication from `FS01$` via a coerced print-spooler\ncall. Whether that yields SYSTEM depends on the context the Spooler used when it\nauthenticated. Demonstrate the privileged operation with a benign, scoped proof\nrather than asserting SYSTEM from the account name."
+    },
+    {
+      "id": "preconditions-and-exploitability",
+      "title": "Preconditions and Exploitability",
+      "type": "breakdown",
+      "content": "**What it is.** The conjunction that separates a live finding from a hygiene note.\nMicrosoft rates attack complexity **High** precisely because several things must\nall hold.\n\n**How it works.** Walk the Five Gates and record Yes, No, or Unknown for each:\n\n| Gate | Question | How to check |\n|------|----------|-------------|\n| Ghost SPN | `HOST`/`CIFS` SPN on target whose host doesn't resolve? | SPN enum plus DNS check (see Implementation) |\n| DNS claim | Can your low-priv account create that name? | ADIDNS ACL review or scoped test record |\n| Signing | Is target **inbound** SMB signing *not required*? | `nxc smb`, nmap `smb2-security-mode`, `Get-SmbServerConfiguration` |\n| Coercion | Can you trigger auth from a suitable context? | Test the RPC interface is reachable |\n| Patch | Is the target missing the Oct 2025 fix? | OS build vs MSRC advisory, per asset |\n\n**Why it matters.** Miss any gate and it is **theoretical**. In particular,\nWindows 11 24H2 and Server 2025 move the install base toward \"not exploitable\" by\nrequiring signing more by default, so your live targets are older or non-default\nhosts. Report **Exploitable** only with all five, ideally a benign, scoped SYSTEM\nproof. Otherwise it is a **hardening finding**, still worth raising, because any\none change re-arms it.\n\n**Example.** `CIFS/OLDFS01` on `FS03$`; `OLDFS01` is NXDOMAIN; `nxc smb FS03`\nshows `signing:False`; you can add a DNS record; Spooler is reachable; `FS03` is\non a June-2025 build. All five gates Yes, so it is an exploitable candidate worth a\nscoped demonstration. Flip signing to required, and it drops to a defence-in-depth\nnote."
+    },
+    {
+      "id": "cve-2025-58726-vs-cve-2025-33073",
+      "title": "CVE-2025-58726 vs CVE-2025-33073",
+      "type": "breakdown",
+      "content": "**What it is.** Two distinct CVEs, months apart, constantly conflated in news\ncoverage. Keeping them straight is both a correctness issue and a credibility one.\n\n**How it works.** **CVE-2025-33073** (Synacktiv, June 2025) was the first reliable\nreflection-to-SYSTEM over SMB. It relied on a *marshalled target info* (CMTI)\nmarker appended to a hostname to trick the client into taking a local-auth path.\nMicrosoft's June fix is client-side (`mrxsmb.sys`): it rejects target names\ncarrying that marker. **CVE-2025-58726** (Semperis, October 2025) needs no marker\nat all, because a ghost SPN uses a genuine registered name, so the client-side\ncheck never fires and the reflection lands server-side.\n\n**Why it matters, and the numbers to get right:**\n\n- **CVE-2025-58726: CVSS 7.5**, exploit maturity **Unproven**, **not** in CISA\n  KEV. Secondary trackers listing 9.9 or 8.8 are wrong; the 8.8 is 33073's score\n  leaking across.\n- **CVE-2025-33073: CVSS 8.8**, **in CISA KEV (added 2025-10-20), actively\n  exploited.**\n\nDo not transfer 33073's \"actively exploited\" urgency onto 58726, and do not quote\na 9.9. If a client has only applied the June patch, they are **not** covered\nagainst 58726. That is often the single most useful sentence in the finding.\n\n**Example.** A vuln scanner flags \"SMB reflection, critical, actively exploited\"\non a host. Before you escalate, separate the two: is this the KEV-listed 33073\n(patch June), or 58726 (patch October, not KEV)? The remediation and the urgency\ndiffer."
+    },
+    {
+      "id": "the-patch-and-what-it-leaves-open",
+      "title": "The Patch and What It Leaves Open",
+      "type": "breakdown",
+      "content": "**What it is.** What the October 2025 fix actually changes, and the risk that\nsurvives it.\n\n**How it works.** The fix is server-side, in `srv2.sys`: a new loopback and\nsource-address validation (`Smb2ValidateLoopbackAddress`, confirmed independently\nby Synacktiv). If an SPN maps to a *local* client security context but the\nconnection arrives **remotely**, the session is terminated. The server now refuses\na remote connection that authenticates with an SPN belonging to itself, which is\nthe definition of reflection.\n\n**Why it matters.** The patch closes the SMB-server case. It does not fix the\nunderlying fact that Kerberos has no general reflection-detection mechanism, so\nghost SPNs may still be abusable against other Kerberos services such as HTTP/ADCS\nand LDAP. A later *local* forwarding variant (**CVE-2026-26128**, Synacktiv, fixed\nMarch 2026 by enforcing signing for local connections) shows the arms race\ncontinuing; treat that as \"study next\" and recommend *current* cumulative updates,\nnot just the October 2025 minimum. The durable controls remain required SMB\nsigning and DNS/SPN hygiene, which hold regardless of patch level.\n\n**Example.** A host patched in October 2025 with signing still optional: the\nremote SMB reflection path is closed, but you would still raise required-signing\nand stale-SPN cleanup, and note the host could be exposed via non-SMB Kerberos\nrelay that the patch does not address."
+    },
+    {
+      "id": "misconceptions",
+      "title": "Common Misconceptions",
+      "type": "misconceptions",
+      "content": "1. **Every unresolved SPN is exploitable.** DNS absence is easy to scan and the word \"ghost\" sounds like a verdict, but ownership, DNS claimability, signing, coercion reachability, and patch state all have to align. Most ghost SPNs are benign leftovers.\n2. **The June 2025 (33073) patch stopped Kerberos reflection over SMB.** It was a client-side fix for the marshalled-marker trick. Ghost SPNs need no marker and reflect server-side; you need the October 2025 patch (58726) to close the SMB-server case, and even that leaves other Kerberos services exposed.\n3. **CVE-2025-58726 is critical, 9.9, actively exploited.** Microsoft scores it 7.5, exploit maturity Unproven. The actively-exploited, KEV-listed, CVSS-8.8 item is the predecessor CVE-2025-33073. Don't merge them.\n4. **Creating the DNS record creates or changes the SPN.** DNS routing and AD service identity are separate state. The dangerous SPN already belongs to the target; you are only redirecting where its name points.\n5. **A computer account authenticating to itself is always SYSTEM.** SYSTEM and NetworkService both present machine credentials; the SYSTEM outcome depends on the originating local context, not the account name. Receiving `TARGET$` auth is not proof of SYSTEM.\n6. **Enabled signing, or \"secure\" dynamic DNS, already blocks this.** Only *required* inbound signing blocks reflection, and \"secure dynamic update\" still grants Authenticated Users record creation by default. Both are feature names, not verified controls; check the actual setting."
+    },
+    {
+      "id": "connections",
+      "title": "Connections & Context",
+      "type": "connections",
+      "content": "- **CVE-2025-33073** (Synacktiv): the client-side parent. Read it first for the\n  reflection mechanics the patches chase.\n- **Reflective Kerberos Relay** (RedTeam Pentesting): the original token-behaviour\n  write-up, which flagged its own early explanation as theory, later confirmed by\n  Synacktiv's reverse engineering. Good for understanding the SYSTEM nuance.\n- **CVE-2026-26128** (Synacktiv, Part 2): the later *local* forwarding variant and\n  its March 2026 fix. Single-sourced in this research, so verify before relying.\n- **ADIDNS attack surface** (NetSPI, Powermad): the DNS-write primitive behind\n  gate 2, also relevant to many other AD attacks.\n- **Coercion catalogue**: PetitPotam, PrinterBug, DFSCoerce, Coercer. The ignition\n  for every relay and reflection chain.\n- **Study next:** apply the ghost-SPN idea to HTTP/ADCS (ESC8-style) and LDAP\n  relay, which Semperis notes remain reachable since the Kerberos root cause is\n  unpatched, and the general class of dangling DNS and subdomain takeover, which\n  shares the \"abandoned name becomes controllable\" shape."
+    },
+    {
+      "id": "implementation",
+      "title": "Implementation",
+      "type": "implementation",
+      "content": "Ordered easiest-first. Everything here is read-only assessment until the lab step.\nDo destructive or exploit actions only in scope, with written authorisation.\n\n1. **Inventory computer SPNs and flag non-resolving hosts.** This is the core\n   deliverable's raw material. Run the author's purpose-built auditor,\n   `TestComputerSpnDNS` (decoder-it), after reviewing the script. It enumerates\n   computer SPNs and flags those whose hostnames don't resolve. Or roll your own:\n   pull `servicePrincipalName` from computer objects (`setspn -T <domain> -Q */*`,\n   PowerView `Get-DomainComputer`, or `Get-ADObject -LDAPFilter\n   '(servicePrincipalName=*)'`) and test each hostname with `Resolve-DnsName`.\n   *Proves:* you can correlate directory names with DNS reality. Keep **SPN +\n   owning account + name** together, not a deduplicated hostname list.\n2. **Build a triage register.** One row per candidate: owning DN, SPN class,\n   original hostname and the actual queried FQDN, resolver, DNS view, response\n   status, timestamp, existing `dnsNode`/tombstone state, DNS-control evidence\n   (and the identity used), target inbound signing, OS build, patch evidence, and\n   disposition. *Proves:* you don't collapse \"stale\" into \"exploitable\". This\n   register *is* your finding's evidence.\n3. **Validate DNS state properly.** Query the target's actual resolver, check A\n   *and* AAAA, follow CNAMEs, and distinguish authoritative NXDOMAIN from SERVFAIL,\n   timeout, or NODATA (`Resolve-DnsName -Server <dc> -DnsOnly -NoHostsFile`, or\n   `dig @<dc> <name> +norecurse`). *Proves:* you can tell absent addressing from a\n   failed lookup, the difference between a real candidate and noise.\n4. **Check DNS write precisely.** Inspect the zone or record ACL for the test\n   identity, distinguishing *create absent node* from *modify existing node*. A\n   tombstoned node behind an absent name changes the answer. Prefer ACL review or a\n   scoped throwaway record over touching a production ghost name. *Proves:* you\n   understand secure dynamic update as an authorisation mechanism, not a label.\n5. **Measure inbound SMB signing on the target.** `nxc smb <cidr>` (with\n   `--gen-relay-list` to auto-filter signing:False hosts), nmap\n   `--script smb2-security-mode`, or `Get-SmbServerConfiguration |\n   fl RequireSecuritySignature` on-host. *Proves:* you assess the receiving\n   boundary, not the client's outbound setting.\n6. **Reproduce the chain in an isolated lab**, only if you need to validate the\n   mechanism. Use a DC, a target member server with a documented ghost `HOST`/`CIFS`\n   SPN and an initially-absent name, and a tester host. Change **one control at a\n   time** between runs (signing required vs not, patched vs not, SYSTEM vs\n   NetworkService origin). A success/failure pair isolates causality far better\n   than one big demo. Use Kerberos-capable tooling and record its version.\n   *Proves:* you can distinguish receiving authentication from achieving usable\n   SYSTEM access.\n7. **Write the finding to the evidence actually obtained.** Title it at the rung\n   you reached (see the Evidence Ladder). \"Unresolved service names require review\"\n   is a different finding from \"Kerberos reflection enabled SYSTEM over SMB\". State\n   observed facts, the identity used for each action, impact (proven vs\n   conditional), and remediation: patch to current cumulative updates, require\n   inbound SMB signing, remove stale SPNs, restrict ADIDNS write, and reduce the\n   coercion surface (RPC filters, disable unneeded Spooler). Mark SYSTEM execution\n   \"not attempted\" unless it was safely demonstrated in scope."
+    }
+  ],
+  "misconceptions": [
+    "Every unresolved SPN is exploitable. DNS absence is easy to scan and the word \"ghost\" sounds like a verdict, but ownership, DNS claimability, signing, coercion reachability, and patch state all have to align. Most ghost SPNs are benign leftovers.",
+    "The June 2025 (33073) patch stopped Kerberos reflection over SMB. It was a client-side fix for the marshalled-marker trick. Ghost SPNs need no marker and reflect server-side; you need the October 2025 patch (58726) to close the SMB-server case, and even that leaves other Kerberos services exposed.",
+    "CVE-2025-58726 is critical, 9.9, actively exploited. Microsoft scores it 7.5, exploit maturity Unproven. The actively-exploited, KEV-listed, CVSS-8.8 item is the predecessor CVE-2025-33073. Don't merge them.",
+    "Creating the DNS record creates or changes the SPN. DNS routing and AD service identity are separate state. The dangerous SPN already belongs to the target; you are only redirecting where its name points.",
+    "A computer account authenticating to itself is always SYSTEM. SYSTEM and NetworkService both present machine credentials; the SYSTEM outcome depends on the originating local context, not the account name. Receiving `TARGET$` auth is not proof of SYSTEM.",
+    "Enabled signing, or \"secure\" dynamic DNS, already blocks this. Only *required* inbound signing blocks reflection, and \"secure dynamic update\" still grants Authenticated Users record creation by default. Both are feature names, not verified controls; check the actual setting."
+  ],
+  "quiz": [
+    {
+      "tier": "recall",
+      "question": "What makes an SPN a \"ghost\" SPN in the CVE-2025-58726 sense?",
+      "options": [
+        "It is assigned to a disabled user account",
+        "Its hostname is not registered/resolvable in DNS",
+        "It uses RC4 instead of AES encryption",
+        "It is duplicated across two accounts"
+      ],
+      "answer": 1,
+      "explanation": "A ghost SPN is one whose hostname does not resolve; the SPN-to-account mapping still works in Kerberos.",
+      "section": {
+        "id": "spn-ownership-vs-dns-routing",
+        "title": "SPN Ownership vs DNS Routing"
+      }
+    },
+    {
+      "tier": "recall",
+      "question": "What is the authoritative CVSS severity of CVE-2025-58726, and its exploitation status?",
+      "options": [
+        "9.9 Critical, actively exploited",
+        "8.8 High, in CISA KEV",
+        "7.5 High, exploit maturity Unproven",
+        "5.3 Medium, no patch available"
+      ],
+      "answer": 2,
+      "explanation": "Microsoft and NVD score it 7.5 with Unproven maturity; the 8.8 and KEV figures belong to the predecessor CVE-2025-33073.",
+      "section": {
+        "id": "cve-2025-58726-vs-cve-2025-33073",
+        "title": "CVE-2025-58726 vs CVE-2025-33073"
+      }
+    },
+    {
+      "tier": "recall",
+      "question": "Which control, when required on the target's inbound side, defeats this attack outright?",
+      "options": [
+        "LDAP channel binding",
+        "SMB signing",
+        "Kerberos AES-only policy",
+        "Credential Guard"
+      ],
+      "answer": 1,
+      "explanation": "Required inbound SMB signing means the reflected session can't produce valid signed operations and dies.",
+      "section": {
+        "id": "preconditions-and-exploitability",
+        "title": "Preconditions and Exploitability"
+      }
+    },
+    {
+      "tier": "comprehension",
+      "question": "Why does the June 2025 (CVE-2025-33073) client-side patch fail to stop the ghost-SPN attack?",
+      "options": [
+        "The patch was never shipped to servers",
+        "Ghost SPNs use NTLM, which the patch ignores",
+        "The 33073 fix rejects target names carrying a marshalled-info marker; a ghost SPN uses a genuine registered name with no marker, so the check never fires and the reflection happens server-side",
+        "The patch only applies to domain controllers"
+      ],
+      "answer": 2,
+      "explanation": "33073 was a client-side fix for the marshalled-marker coercion trick; ghost SPNs need no marker and reflect server-side, which is why 58726 needed its own October patch.",
+      "section": {
+        "id": "cve-2025-58726-vs-cve-2025-33073",
+        "title": "CVE-2025-58726 vs CVE-2025-33073"
+      }
+    },
+    {
+      "tier": "comprehension",
+      "question": "Why does receiving authentication from `FS01$` not by itself prove you will get SYSTEM?",
+      "options": [
+        "Computer accounts cannot authenticate with Kerberos",
+        "SYSTEM and NetworkService both present the machine's credentials, so the account name doesn't reveal the originating local context",
+        "Every machine-account authentication is already SYSTEM",
+        "DNS record ownership determines the resulting Windows token"
+      ],
+      "answer": 1,
+      "explanation": "The SYSTEM outcome depends on the originating context (and a subkey lookup), not on the `HOST$` account name alone.",
+      "section": {
+        "id": "why-the-result-can-become-system",
+        "title": "Why the Result Can Become SYSTEM"
+      }
+    },
+    {
+      "tier": "comprehension",
+      "question": "What does an nmap result of \"message signing enabled but not required\" tell you about exploitability?",
+      "options": [
+        "The host is patched and safe",
+        "Signing is mandatory, so reflection is blocked",
+        "The host supports signing but does not refuse unsigned sessions, so the signing gate is open",
+        "Kerberos is disabled on the host"
+      ],
+      "answer": 2,
+      "explanation": "Only *required* signing blocks reflection; \"enabled\" means capable, not enforced.",
+      "section": {
+        "id": "preconditions-and-exploitability",
+        "title": "Preconditions and Exploitability"
+      }
+    },
+    {
+      "tier": "application",
+      "question": "You find `CIFS/OLDFS01` on computer account `FS03$`; `OLDFS01` does not resolve; `nxc smb FS03` shows `signing:False`; you can add a DNS record as a normal user; the Spooler is reachable; the host is on a June-2025 build. What is the correct conclusion?",
+      "options": [
+        "Not exploitable, because SPNs on computer accounts can't be relayed",
+        "Exploitable candidate: all five gates pass, so in scope you register the name, stand up the relay, coerce `FS03`, and reflect; otherwise report as exploitable with the evidence",
+        "Only Kerberoastable: request the ticket and crack `FS03$` offline",
+        "Exploitable only if you are already Domain Admin"
+      ],
+      "answer": 1,
+      "explanation": "Ghost SPN, DNS claim, signing not required, coercion reachable, and unpatched all hold: the full conjunction.",
+      "section": {
+        "id": "preconditions-and-exploitability",
+        "title": "Preconditions and Exploitability"
+      }
+    },
+    {
+      "tier": "application",
+      "question": "A scanner reports \"SMB reflection, critical, actively exploited\" on a server patched in June 2025 with signing optional. What is the most accurate next step?",
+      "options": [
+        "Mark it remediated, because the June patch covers SMB reflection",
+        "Separate the CVEs: the June patch covers 33073 (the KEV and actively-exploited one) but not 58726, so the host may still be exposed until the October patch and required signing are in place",
+        "Escalate as actively-exploited 58726 with CVSS 9.9",
+        "Ignore it, because 58726 is Unproven, so there's no finding"
+      ],
+      "answer": 1,
+      "explanation": "The urgency belongs to 33073; 58726 is a separate, October-patched, non-KEV issue that the June patch does not close.",
+      "section": {
+        "id": "cve-2025-58726-vs-cve-2025-33073",
+        "title": "CVE-2025-58726 vs CVE-2025-33073"
+      }
+    },
+    {
+      "tier": "application",
+      "question": "You can create brand-new DNS names as a low-priv user, but the ghost name `archive` already exists as a tombstoned node you cannot modify. What does this mean for gate 2?",
+      "options": [
+        "Gate 2 passes, because you have DNS write rights in the zone",
+        "Gate 2 is not automatically satisfied: creating absent names and modifying an existing (tombstoned) node are different access checks, so you must evaluate that node's actual permissions",
+        "The SPN is no longer a ghost because the node exists",
+        "Signing is now irrelevant"
+      ],
+      "answer": 1,
+      "explanation": "Create-child and modify-existing are distinct rights; an existing tombstoned node can block the claim even when you can create fresh names.",
+      "section": {
+        "id": "preconditions-and-exploitability",
+        "title": "Preconditions and Exploitability"
+      }
+    },
+    {
+      "tier": "challenge",
+      "question": "The October 2025 patch adds a server-side loopback check in `srv2.sys` but leaves the Kerberos reflection root cause intact. Design an engagement methodology to determine whether a *fully patched* estate is still exposed to ghost-SPN reflection against **non-SMB** Kerberos services (HTTP/ADCS, LDAP). What would you enumerate, what distinguishes exploitable from theoretical for those services, and how would you demonstrate impact safely within scope?",
+      "options": [],
+      "answer": 0,
+      "explanation": "",
+      "section": null
+    },
+    {
+      "tier": "challenge",
+      "question": "You find `HOST/archive.corp.local` on `FS01$`. One resolver returns NXDOMAIN; another returns a CNAME to an IPv6-only endpoint. Your account can create unrelated names but cannot modify the existing `archive` node. Inbound signing is optional, the October 2025 update is installed, and you have a low-privilege shell on `FS01`. Which gates are Yes, No, or Unknown? How would you tell the original remote CVE apart from a later *local* reflection scenario, and what minimum additional evidence would justify raising, lowering, or splitting the finding?",
+      "options": [],
+      "answer": 0,
+      "explanation": "",
+      "section": null
+    }
+  ],
+  "sources": [],
+  "factCheckNotes": []
+}

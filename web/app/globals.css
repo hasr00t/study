@@ -1,0 +1,72 @@
+@import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&family=Noticia+Text:ital,wght@0,400;0,700;1,400&display=swap');
+@import "tailwindcss";
+
+/* Theme is driven by the .dark class on <html>, not the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --ground: #F4F2ED;
+  --surface: #FFFFFF;
+  --surface-2: #EAE7E1;
+  --text: #2C3040;
+  --text-dim: #6B7080;
+  --text-bright: #1A1D28;
+  --accent: #C04030;
+  --accent-dim: rgba(192,64,48,0.1);
+  --defend: #2D7A50;
+  --defend-dim: rgba(45,122,80,0.1);
+  --border: #D8D5CE;
+  --code-bg: #EAE6DE;
+  --code-text: #2C3040;
+  --accent-deep: #8C2C1F;
+  --rail: #E7E3DA;
+  --rail-border: #D3CEC3;
+}
+
+.dark {
+  --ground: #141820;
+  --surface: #1C2030;
+  --surface-2: #252A3A;
+  --text: #C5CBDA;
+  --text-dim: #6B7489;
+  --text-bright: #E8ECF4;
+  --accent: #D4593B;
+  --accent-dim: rgba(212,89,59,0.12);
+  --defend: #3B9B68;
+  --defend-dim: rgba(59,155,104,0.12);
+  --border: #2A3045;
+  --code-bg: #0F1219;
+  --code-text: #B8C4D8;
+  --accent-deep: #E8724F;
+  --rail: #171B25;
+  --rail-border: #262C3D;
+}
+
+/* Expose the design tokens as Tailwind utilities (bg-surface, text-accent,
+   font-display, ...). These point at the vars above, so they follow the
+   active theme instead of being pinned to one palette. */
+@theme inline {
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-text-primary: var(--text);
+  --color-text-dim: var(--text-dim);
+  --color-text-bright: var(--text-bright);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-defend: var(--defend);
+  --color-defend-dim: var(--defend-dim);
+  --color-border: var(--border);
+  --color-code-bg: var(--code-bg);
+  --color-code-text: var(--code-text);
+
+  --font-display: Rubik, "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Noticia Text", Georgia, serif;
+  --font-mono: "SFMono-Regular", "Cascadia Code", "Fira Code", Consolas, monospace;
+}
+
+body {
+  background: var(--ground);
+  color: var(--text);
+  font-family: "Noticia Text", Georgia, serif;
+}
