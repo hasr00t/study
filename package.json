@@ -1,0 +1,16 @@
+{
+  "name": "study-skill",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "lib",
+    "web"
+  ],
+  "scripts": {
+    "test:lib": "vitest run --config vitest.config.js",
+    "dev": "cd web && npm run dev"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11"
+  }
+}
